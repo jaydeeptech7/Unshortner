@@ -1,581 +1,607 @@
 
 import re
 import time
-import socket
 import ipaddress
-from urllib.parse import urlparse, urljoin, urldefrag
+import socket
+from urllib.parse import urljoin, urlparse
 
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 st.set_page_config(
-    page_title="Shortlink Resolver",
+    page_title="Telegram Shortlink Resolver",
     page_icon="🔗",
     layout="wide",
 )
 
 st.title("🔗 Shortlink Resolver")
-st.caption("Cloud-hosted redirects • JavaScript navigation • Link extraction")
+st.caption(
+    "Resolve ordinary redirects and JavaScript-based shortlinks, "
+    "with step-by-step browser diagnostics."
+)
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
-# --------------------------------------------------
-# URL helpers
-# --------------------------------------------------
+MAX_STEPS = 15
+MAX_WAIT_SECONDS = 45
+
+CONTINUE_WORDS = re.compile(
+    r"^\s*(continue|continue to site|next|proceed|"
+    r"get link|go to link|visit link|open link|"
+    r"skip|continue now|click here|"
+    r"download|access link)\s*$",
+    re.I,
+)
+
+CLOSE_WORDS = re.compile(
+    r"^\s*(close|dismiss|×|x|no thanks|not now|"
+    r"maybe later|got it|cancel)\s*$",
+    re.I,
+)
+
+BLOCK_WORDS = [
+    "sorry, you have been blocked",
+    "you have been blocked",
+    "attention required! | cloudflare",
+    "verify you are human",
+    "checking your browser",
+    "enable javascript and cookies to continue",
+]
+
 
 def normalize_url(value):
     value = (value or "").strip()
-
     if not value:
-        raise ValueError("Enter a URL.")
-
-    if "://" not in value:
+        return ""
+    if not re.match(r"^https?://", value, re.I):
         value = "https://" + value
-
     parsed = urlparse(value)
-
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("Enter a valid HTTP or HTTPS URL.")
-
-    if parsed.username or parsed.password:
-        raise ValueError("URLs containing embedded credentials are not supported.")
-
-    return urldefrag(value).url
+        return ""
+    return value
 
 
-def is_public_url(url):
-    """Basic protection against requests to private/internal addresses."""
+def public_url_check(url):
+    """Reject obvious private/local destinations before navigation."""
     try:
         parsed = urlparse(url)
         host = parsed.hostname
+        if not host:
+            return False, "Missing hostname."
 
-        if parsed.scheme not in ("http", "https") or not host:
-            return False
-
-        if host == "localhost" or host.endswith(".localhost"):
-            return False
+        if host.lower() in ("localhost",):
+            return False, "Local destinations are not allowed."
 
         try:
-            addresses = [ipaddress.ip_address(host)]
+            ipaddress.ip_address(host)
+            addresses = [host]
         except ValueError:
-            answers = socket.getaddrinfo(
-                host,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
-            )
-            addresses = [
-                ipaddress.ip_address(answer[4][0])
-                for answer in answers
-            ]
+            addresses = list({
+                result[4][0]
+                for result in socket.getaddrinfo(
+                    host, parsed.port or (443 if parsed.scheme == "https" else 80)
+                )
+            })
 
-        return bool(addresses) and all(addr.is_global for addr in addresses)
+        if not addresses:
+            return False, "Hostname did not resolve."
 
-    except Exception:
-        return False
+        for address in addresses:
+            ip = ipaddress.ip_address(address)
+            if not ip.is_global:
+                return False, "Private or non-public destination blocked."
+
+        return True, ""
+    except Exception as exc:
+        return False, f"Could not validate destination: {exc}"
 
 
-def detect_block(title, body):
-    text = f"{title}\n{body}".lower()
-
-    return any(term in text for term in (
-        "sorry, you have been blocked",
-        "you are unable to access",
-        "attention required! | cloudflare",
-        "cloudflare ray id",
-        "cf-error-details",
-        "error 1020",
-        "error 1010",
-    ))
+def looks_blocked(text, title=""):
+    combined = f"{title}\n{text}".lower()
+    return any(word in combined for word in BLOCK_WORDS)
 
 
 def get_ray_id(text):
     match = re.search(
-        r"Cloudflare Ray ID:\s*([a-fA-F0-9]+)",
-        text or "",
-        re.IGNORECASE,
+        r"(?:cloudflare ray id|ray id)\s*[:#]?\s*([a-f0-9-]+)",
+        text,
+        re.I,
     )
-    return match.group(1) if match else ""
+    return match.group(1) if match else None
 
 
-# --------------------------------------------------
-# HTTP redirect resolver
-# --------------------------------------------------
-
-def resolve_http(start_url, timeout=15):
-    history = []
-    responses = []
+def extract_links(html, base_url):
+    soup = BeautifulSoup(html or "", "html.parser")
     links = []
+    for tag in soup.select("a[href], form[action]"):
+        value = tag.get("href") or tag.get("action")
+        if value:
+            absolute = urljoin(base_url, value)
+            if absolute.startswith(("http://", "https://")):
+                links.append(absolute)
+    return list(dict.fromkeys(links))
+
+
+def resolve_http(start_url, max_steps=MAX_STEPS):
+    history = []
     errors = []
+    current = start_url
 
-    current_url = start_url
-    final_url = start_url
-    title = ""
-    body_text = ""
-    blocked = False
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": USER_AGENT})
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
-    })
+        for step in range(max_steps):
+            allowed, reason = public_url_check(current)
+            if not allowed:
+                errors.append(reason)
+                break
 
-    for step in range(10):
-        if not is_public_url(current_url):
-            errors.append("Stopped at a non-public or invalid destination.")
-            break
-
-        try:
-            response = session.get(
-                current_url,
-                timeout=timeout,
-                allow_redirects=False,
-                stream=True,
-            )
-
-            location = response.headers.get("Location", "")
-
-            responses.append({
-                "Step": step + 1,
-                "Status": response.status_code,
-                "URL": current_url,
-                "Location": urljoin(current_url, location) if location else "",
-            })
-
-            history.append({
-                "Step": len(history) + 1,
-                "URL": current_url,
-                "Event": f"HTTP {response.status_code}",
-            })
-
-            if response.status_code in (301, 302, 303, 307, 308) and location:
-                next_url = urljoin(current_url, location)
-                response.close()
-
-                if next_url == current_url:
-                    break
-
-                current_url = next_url
-                final_url = current_url
-                continue
-
-            content_type = response.headers.get("Content-Type", "").lower()
-
-            if "text/html" in content_type:
-                chunks = []
-                total = 0
-
-                for chunk in response.iter_content(chunk_size=8192):
-                    if not chunk:
-                        continue
-
-                    remaining = 1_000_000 - total
-                    if remaining <= 0:
-                        break
-
-                    chunk = chunk[:remaining]
-                    chunks.append(chunk)
-                    total += len(chunk)
-
-                    if total >= 1_000_000:
-                        break
-
-                html = b"".join(chunks).decode(
-                    response.encoding or "utf-8",
-                    errors="replace",
+            try:
+                response = session.get(
+                    current,
+                    allow_redirects=False,
+                    timeout=15,
+                    stream=True,
                 )
+                status = response.status_code
+                content_type = response.headers.get("content-type", "")
+                location = response.headers.get("location")
 
-                soup = BeautifulSoup(html, "html.parser")
+                history.append({
+                    "step": step + 1,
+                    "url": current,
+                    "status": status,
+                    "type": content_type,
+                })
 
-                title = (
-                    soup.title.get_text(" ", strip=True)
-                    if soup.title else ""
-                )
-                body_text = soup.get_text(" ", strip=True)[:12000]
-
-                for anchor in soup.select("a[href]")[:300]:
-                    links.append({
-                        "Text": anchor.get_text(" ", strip=True)[:200],
-                        "URL": urljoin(current_url, anchor.get("href", "")),
-                    })
-
-                blocked = detect_block(title, body_text)
-
-                if blocked:
+                if status in (301, 302, 303, 307, 308) and location:
+                    next_url = urljoin(current, location)
                     response.close()
-                    break
+                    if next_url == current:
+                        break
+                    current = next_url
+                    continue
 
-                meta = soup.find(
-                    "meta",
-                    attrs={"http-equiv": re.compile("^refresh$", re.I)},
-                )
-
-                if meta:
-                    match = re.search(
-                        r"url\s*=\s*['\"]?([^'\"]+)",
-                        meta.get("content", ""),
-                        re.I,
+                body = ""
+                if "text/html" in content_type.lower():
+                    chunks = []
+                    size = 0
+                    for chunk in response.iter_content(16384):
+                        size += len(chunk)
+                        chunks.append(chunk)
+                        if size >= 500_000:
+                            break
+                    body = b"".join(chunks).decode(
+                        response.encoding or "utf-8", errors="replace"
                     )
 
+                response.close()
+
+                if looks_blocked(body):
+                    errors.append(
+                        "Access or Cloudflare block detected in HTTP mode."
+                    )
+                    return {
+                        "destination": None,
+                        "last_url": current,
+                        "history": history,
+                        "errors": errors,
+                        "page_text": body[:3000],
+                        "blocked": True,
+                    }
+
+                soup = BeautifulSoup(body, "html.parser")
+                meta = soup.find(
+                    "meta",
+                    attrs={"http-equiv": re.compile(r"refresh", re.I)},
+                )
+                if meta:
+                    content = meta.get("content", "")
+                    match = re.search(
+                        r"url\s*=\s*['\"]?([^'\"]+)",
+                        content,
+                        re.I,
+                    )
                     if match:
-                        next_url = urljoin(current_url, match.group(1).strip())
+                        current = urljoin(current, match.group(1).strip())
+                        continue
 
-                        if is_public_url(next_url):
-                            response.close()
-                            current_url = next_url
-                            final_url = next_url
-                            continue
+                return {
+                    "destination": current,
+                    "last_url": current,
+                    "history": history,
+                    "errors": errors,
+                    "page_text": soup.get_text(" ", strip=True)[:3000],
+                    "links": extract_links(body, current),
+                    "blocked": False,
+                }
 
-            response.close()
-            final_url = current_url
-            break
-
-        except Exception as exc:
-            errors.append(f"HTTP resolution: {str(exc)[:250]}")
-            break
-
-    session.close()
+            except requests.RequestException as exc:
+                errors.append(str(exc))
+                break
 
     return {
-        "original_url": start_url,
-        "final_url": final_url,
+        "destination": None,
+        "last_url": current,
         "history": history,
-        "responses": responses,
-        "links": links,
         "errors": errors,
-        "title": title,
-        "text": body_text,
-        "blocked": blocked,
-        "ray_id": get_ray_id(body_text),
+        "blocked": False,
     }
 
 
-# --------------------------------------------------
-# Cloud-hosted headless Chromium
-# --------------------------------------------------
-
-def resolve_browser(start_url, wait_seconds, scroll_passes):
+def resolve_browser(start_url):
     history = []
     responses = []
+    actions = []
     errors = []
-    seen = set()
-
-    final_url = start_url
-    title = ""
-    body_text = ""
-    links = []
-    controls = []
+    current = start_url
     blocked = False
-
-    def record(url, event):
-        if url and url not in seen:
-            seen.add(url)
-            history.append({
-                "Step": len(history) + 1,
-                "URL": url,
-                "Event": event,
-            })
+    final_text = ""
+    final_links = []
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-
         context = browser.new_context(
+            user_agent=USER_AGENT,
             viewport={"width": 1365, "height": 900},
-            locale="en-US",
+            ignore_https_errors=False,
         )
         page = context.new_page()
-        page.set_default_timeout(7000)
+        page.set_default_timeout(2500)
 
         def guard_request(route):
             request_url = route.request.url
-
-            if urlparse(request_url).scheme not in ("http", "https"):
-                route.abort()
+            if request_url.startswith(("data:", "blob:", "about:")):
+                route.continue_()
                 return
 
-            if not is_public_url(request_url):
+            allowed, reason = public_url_check(request_url)
+            if allowed:
+                route.continue_()
+            else:
+                actions.append(f"Blocked unsafe request: {reason}")
                 route.abort()
-                return
-
-            route.continue_()
 
         page.route("**/*", guard_request)
 
         page.on(
-            "framenavigated",
-            lambda frame: record(frame.url, "Navigation")
-            if frame == page.main_frame else None,
+            "response",
+            lambda response: responses.append({
+                "status": response.status,
+                "url": response.url,
+            }) if len(responses) < 100 else None,
         )
 
-        def on_response(response):
-            try:
-                if response.request.is_navigation_request():
-                    responses.append({
-                        "Status": response.status,
-                        "URL": response.url,
-                        "Redirected from": (
-                            response.request.redirected_from.url
-                            if response.request.redirected_from else ""
-                        ),
-                    })
-            except Exception:
-                pass
-
-        page.on("response", on_response)
+        seen_urls = set()
 
         try:
-            record(start_url, "Submitted URL")
+            allowed, reason = public_url_check(current)
+            if not allowed:
+                return {
+                    "destination": None,
+                    "last_url": current,
+                    "history": history,
+                    "responses": responses,
+                    "actions": actions,
+                    "errors": [reason],
+                    "blocked": False,
+                }
 
             page.goto(
-                start_url,
+                current,
                 wait_until="domcontentloaded",
-                timeout=30000,
+                timeout=25000,
             )
 
-        except PlaywrightTimeoutError:
-            errors.append("Initial page load timed out.")
-        except Exception as exc:
-            errors.append(f"Browser navigation: {str(exc)[:250]}")
+            for step in range(MAX_STEPS):
+                current = page.url
 
-        deadline = time.monotonic() + wait_seconds
+                if current not in seen_urls:
+                    seen_urls.add(current)
+                    history.append(current)
 
-        for index in range(scroll_passes + 1):
-            if time.monotonic() >= deadline:
-                break
+                try:
+                    page.wait_for_load_state(
+                        "domcontentloaded", timeout=3000
+                    )
+                except PlaywrightTimeoutError:
+                    pass
 
-            try:
-                record(page.url, "Observed URL")
+                try:
+                    page.wait_for_timeout(1200)
+                    title = page.title()
+                    final_text = page.locator("body").inner_text(
+                        timeout=3000
+                    )[:8000]
+                except Exception:
+                    title, final_text = "", ""
 
-                if index < scroll_passes:
+                if looks_blocked(final_text, title):
+                    blocked = True
+                    errors.append(
+                        "Cloudflare/access verification detected. "
+                        "The hosted browser cannot continue through this block."
+                    )
+                    break
+
+                final_links = extract_links(
+                    page.content(), page.url
+                )
+
+                # Close ordinary visible dialogs and overlays.
+                closed = False
+                for selector in [
+                    'button[aria-label="Close"]',
+                    'button[aria-label="close"]',
+                    '[role="dialog"] button',
+                    '.modal button.close',
+                    '.close',
+                    'button.close',
+                ]:
+                    try:
+                        candidates = page.locator(selector)
+                        for index in range(min(candidates.count(), 4)):
+                            item = candidates.nth(index)
+                            if item.is_visible() and item.is_enabled():
+                                item.click(timeout=1000)
+                                actions.append(
+                                    f"Step {step + 1}: closed overlay ({selector})"
+                                )
+                                closed = True
+                                break
+                    except Exception:
+                        continue
+                    if closed:
+                        break
+
+                if closed:
+                    page.wait_for_timeout(500)
+
+                # Scroll in case a normal Continue button is below the fold.
+                try:
                     page.evaluate(
                         "() => window.scrollTo(0, document.body.scrollHeight)"
                     )
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
 
-                remaining = max(0, deadline - time.monotonic())
-                page.wait_for_timeout(int(min(3, remaining) * 1000))
-                record(page.url, "After wait/scroll")
+                clicked = False
 
-            except Exception as exc:
-                errors.append(f"Page observation: {str(exc)[:250]}")
+                # Find normal buttons, links, and submit controls by label.
+                selectors = [
+                    "button",
+                    'input[type="button"]',
+                    'input[type="submit"]',
+                    'a',
+                    '[role="button"]',
+                ]
+
+                for selector in selectors:
+                    try:
+                        elements = page.locator(selector)
+                        count = min(elements.count(), 80)
+
+                        for index in range(count):
+                            item = elements.nth(index)
+
+                            try:
+                                if not item.is_visible() or not item.is_enabled():
+                                    continue
+
+                                label = (
+                                    item.inner_text(timeout=500)
+                                    or item.get_attribute("value")
+                                    or item.get_attribute("aria-label")
+                                    or ""
+                                ).strip()
+
+                                if not CONTINUE_WORDS.match(label):
+                                    continue
+
+                                before = page.url
+                                item.click(timeout=1500)
+                                actions.append(
+                                    f"Step {step + 1}: clicked "
+                                    f"{label[:60]!r}"
+                                )
+                                clicked = True
+
+                                # Allow a timer or navigation to progress.
+                                for _ in range(5):
+                                    page.wait_for_timeout(1000)
+                                    if page.url != before:
+                                        break
+
+                                break
+
+                            except Exception:
+                                continue
+
+                    except Exception:
+                        continue
+
+                    if clicked:
+                        break
+
+                if clicked:
+                    continue
+
+                # Wait briefly for ordinary timer-driven buttons to enable.
+                try:
+                    page.wait_for_timeout(2000)
+                    newly_enabled = page.locator(
+                        "button:enabled, input[type=submit]:enabled"
+                    ).count()
+                    if newly_enabled:
+                        actions.append(
+                            f"Step {step + 1}: checked for enabled buttons"
+                        )
+                except Exception:
+                    pass
+
+                # Detect if the page has moved on automatically.
+                if page.url != current:
+                    continue
+
                 break
-
-        while time.monotonic() < deadline:
-            try:
-                record(page.url, "Navigation monitor")
-                page.wait_for_timeout(500)
-            except Exception:
-                break
-
-        try:
-            final_url = page.url
-            title = page.title()
-            body_text = page.locator("body").inner_text(timeout=4000)[:12000]
-
-            blocked = detect_block(title, body_text)
-
-            links = page.locator("a[href]").evaluate_all(
-                """els => els.slice(0, 300).map(a => ({
-                    Text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
-                    URL: a.href
-                }))"""
-            )
-
-            controls = page.locator(
-                "button, input[type=button], input[type=submit], [role=button]"
-            ).evaluate_all(
-                """els => els.slice(0, 100).map(e => ({
-                    Text: (e.innerText || e.value ||
-                        e.getAttribute('aria-label') || '').trim()
-                })).filter(x => x.Text &&
-                    /continue|next|proceed|download|skip|unlock|go to link/i.test(x.Text))"""
-            )
-
-            record(final_url, "Final observation")
 
         except Exception as exc:
-            errors.append(f"Page inspection: {str(exc)[:250]}")
+            errors.append(f"Browser error: {exc}")
 
-        context.close()
+        try:
+            current = page.url
+            if current not in seen_urls:
+                history.append(current)
+            final_text = page.locator("body").inner_text(
+                timeout=2000
+            )[:8000]
+            final_links = extract_links(page.content(), current)
+        except Exception:
+            pass
+
         browser.close()
 
+    destination = None if blocked else current
+
     return {
-        "original_url": start_url,
-        "final_url": final_url,
+        "destination": destination,
+        "last_url": current,
         "history": history,
         "responses": responses,
-        "links": links,
-        "controls": controls,
+        "actions": actions,
         "errors": errors,
-        "title": title,
-        "text": body_text,
+        "page_text": final_text,
+        "links": final_links,
         "blocked": blocked,
-        "ray_id": get_ray_id(body_text),
     }
 
 
-# --------------------------------------------------
-# Streamlit UI
-# --------------------------------------------------
-
-with st.sidebar:
-    st.header("Settings")
-
-    mode = st.radio(
-        "Resolution method",
-        ["HTTP redirects", "JavaScript browser", "Browser preview"],
-    )
-
-    wait_seconds = st.slider("Wait for navigation (seconds)", 5, 30, 15)
-    scroll_passes = st.slider("Scroll passes", 0, 8, 3)
-
-with st.form("resolve_form"):
-    entered_url = st.text_input(
-        "Short URL",
-        placeholder="https://arolinks.com/flzphw",
-    )
-    submitted = st.form_submit_button("Resolve", type="primary")
-
-if submitted:
-    try:
-        start_url = normalize_url(entered_url)
-
-        if not is_public_url(start_url):
-            st.error("The URL is invalid or resolves to a non-public address.")
-            st.stop()
-
-        if mode == "HTTP redirects":
-            with st.spinner("Following HTTP redirects..."):
-                result = resolve_http(start_url)
-
-        elif mode == "JavaScript browser":
-            with st.spinner("Starting headless Chromium..."):
-                result = resolve_browser(
-                    start_url,
-                    wait_seconds,
-                    scroll_passes,
-                )
-
-        else:
-            result = {
-                "original_url": start_url,
-                "final_url": start_url,
-                "history": [],
-                "responses": [],
-                "links": [],
-                "controls": [],
-                "errors": [],
-                "title": "",
-                "text": "",
-                "blocked": False,
-                "ray_id": "",
-            }
-
-        st.session_state["result"] = result
-        st.session_state["preview_url"] = start_url
-
-    except Exception as exc:
-        st.error(f"Resolution failed: {str(exc)[:400]}")
-
-
-result = st.session_state.get("result")
-
-if result:
-    st.divider()
+def show_result(result, original):
     st.subheader("Resolution result")
 
     if result.get("blocked"):
-        st.error("Cloudflare/access block detected.")
-
-        if result.get("ray_id"):
-            st.write("**Cloudflare Ray ID:**", result["ray_id"])
-
-        st.info(
-            "The hosted browser cannot access the destination through this "
-            "blocked response. Open the original URL in your normal browser "
-            "and paste the destination below if it resolves there."
+        st.error(
+            "Cloudflare/access block detected. The hosted browser "
+            "cannot resolve this link through the blocked response."
+        )
+    elif result.get("destination"):
+        st.success("Resolution process completed.")
+        st.code(result["destination"])
+        st.link_button(
+            "Open destination",
+            result["destination"],
+            use_container_width=True,
+        )
+    else:
+        st.warning(
+            "No final destination could be confirmed. "
+            "Review the diagnostics below."
         )
 
-    st.write("**Original URL**")
-    st.code(result.get("original_url", ""), language=None)
+    st.markdown("**Original URL**")
+    st.code(original)
 
-    st.write("**Last observed URL**")
-    st.code(result.get("final_url", ""), language=None)
+    st.markdown("**Last observed URL**")
+    st.code(result.get("last_url") or "Not available")
 
-    if result.get("final_url"):
-        st.link_button("Open URL in your browser", result["final_url"])
-
-    st.subheader("Navigation history")
     if result.get("history"):
-        st.dataframe(result["history"], use_container_width=True, hide_index=True)
+        with st.expander("Navigation history", expanded=True):
+            for index, url in enumerate(result["history"], 1):
+                st.write(f"{index}. {url}")
 
-    st.subheader("HTTP navigation responses")
+    if result.get("actions"):
+        with st.expander("Browser actions", expanded=True):
+            for action in result["actions"]:
+                st.write(f"- {action}")
+
     if result.get("responses"):
-        st.dataframe(result["responses"], use_container_width=True, hide_index=True)
+        with st.expander("HTTP navigation responses"):
+            for response in result["responses"]:
+                st.write(
+                    f"{response['status']} — {response['url']}"
+                )
 
-    st.subheader("Extracted links")
     if result.get("links"):
-        st.dataframe(result["links"], use_container_width=True, hide_index=True)
+        with st.expander("Extracted links"):
+            for link in result["links"][:60]:
+                st.write(link)
 
-    if result.get("controls") is not None:
-        with st.expander("Possible Continue / Next controls"):
-            st.dataframe(result["controls"], use_container_width=True, hide_index=True)
+    if result.get("page_text"):
+        with st.expander("Page text"):
+            st.text(result["page_text"])
 
-    with st.expander("Page text"):
-        st.text(result.get("text") or "(No page text available)")
+    if result.get("errors"):
+        with st.expander("Errors"):
+            for error in result["errors"]:
+                st.write(f"- {error}")
 
-    with st.expander("Errors"):
-        for error in result.get("errors", []):
-            st.write("- " + error)
+    st.divider()
+    st.subheader("Manual destination fallback")
+    manual = st.text_input(
+        "Paste the final destination URL if you resolved it in your browser",
+        key="manual_destination",
+    )
 
-
-# Browser preview: this renders the page in the visitor's browser.
-# It does not proxy requests through the Python server.
-if mode == "Browser preview":
-    preview_url = st.session_state.get("preview_url", "")
-
-    if preview_url:
-        st.subheader("Browser preview")
-        st.caption(
-            "Some sites prohibit iframe embedding. If the preview is blocked, "
-            "use the open-in-browser link instead."
-        )
-
-        components.iframe(
-            preview_url,
-            height=650,
-            scrolling=True,
-        )
-
-        st.link_button("Open page in a new browser tab", preview_url)
-
-
-st.divider()
-st.subheader("Manual destination fallback")
-
-manual_url = st.text_input(
-    "Paste the destination URL you reached in your browser",
-    key="manual_destination",
-    placeholder="https://destination.example/",
-)
-
-if manual_url:
-    try:
-        destination = normalize_url(manual_url)
-
-        if is_valid_manual_destination := (
-            urlparse(destination).scheme in ("http", "https")
-            and bool(urlparse(destination).hostname)
-        ):
-            st.link_button("Open destination", destination)
+    if st.button("Use manual destination"):
+        candidate = normalize_url(manual)
+        if not candidate:
+            st.error("Enter a valid HTTP or HTTPS URL.")
         else:
-            st.warning("Enter a valid HTTP/HTTPS URL.")
-    except ValueError as exc:
-        st.warning(str(exc))
+            st.session_state["manual_result"] = candidate
+            st.success("Manual destination saved for this session.")
+            st.code(candidate)
+            st.link_button("Open manual destination", candidate)
+
+
+with st.sidebar:
+    st.header("Settings")
+    mode = st.radio(
+        "Resolution mode",
+        [
+            "HTTP redirects",
+            "JavaScript browser",
+        ],
+        index=1,
+    )
+    st.caption(
+        "Browser mode handles ordinary buttons and multi-step pages. "
+        "It does not bypass access controls or human-verification challenges."
+    )
+
+with st.form("resolver_form"):
+    entered_url = st.text_input(
+        "Shortlink URL",
+        placeholder="https://example.com/abc123",
+    )
+    submitted = st.form_submit_button(
+        "Resolve link",
+        type="primary",
+        use_container_width=True,
+    )
+
+if submitted:
+    original = normalize_url(entered_url)
+
+    if not original:
+        st.error("Enter a valid HTTP or HTTPS URL.")
+    else:
+        with st.spinner("Resolving link and inspecting page steps..."):
+            if mode == "HTTP redirects":
+                result = resolve_http(original)
+            else:
+                result = resolve_browser(original)
+
+        show_result(result, original)
