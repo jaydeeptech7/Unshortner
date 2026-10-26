@@ -1,573 +1,332 @@
 
 import ipaddress
-import os
 import socket
 import subprocess
 import sys
 import time
-from urllib.parse import urlparse, urldefrag
+from urllib.parse import urldefrag, urlparse
 
 import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-
-st.set_page_config(
-    page_title="Smart Shortlink Resolver",
-    page_icon="🔗",
-    layout="wide",
-)
-
-st.title("🔗 Smart Shortlink Resolver")
-st.caption(
-    "Inspect redirects, JavaScript navigation, timed pages, intermediate URLs, "
-    "and possible destination links."
-)
-
-MAX_URL_LENGTH = 4096
-MAX_HISTORY = 100
-MAX_LINKS = 150
-MAX_NAVIGATIONS = 30
+st.set_page_config(page_title="Shortlink Resolver", page_icon="🔗", layout="wide")
+st.title("🔗 Streamlit Shortlink Resolver")
+st.caption("HTTP redirects • JavaScript navigation • Timers • Scroll • Link detection")
 
 
-def normalize_url(raw_url):
-    raw_url = (raw_url or "").strip()
+def normalize_url(value):
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("Enter a URL.")
 
-    if not raw_url or len(raw_url) > MAX_URL_LENGTH:
-        raise ValueError("Enter a valid URL under 4096 characters.")
+    if "://" not in value:
+        value = "https://" + value
 
-    if "://" not in raw_url:
-        raw_url = "https://" + raw_url
-
-    parsed = urlparse(raw_url)
-
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Only HTTP and HTTPS URLs are supported.")
-
-    if not parsed.hostname:
-        raise ValueError("The URL must contain a hostname.")
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only valid HTTP/HTTPS URLs are supported.")
 
     if parsed.username or parsed.password:
-        raise ValueError("URLs with embedded usernames or passwords are not supported.")
+        raise ValueError("URLs containing embedded credentials are not supported.")
 
-    return urldefrag(raw_url).url
+    return urldefrag(value).url
 
 
-def check_public_url(url):
-    """
-    Basic SSRF protection. This is not a complete security boundary:
-    public deployments should additionally enforce network-level egress rules.
-    """
-    parsed = urlparse(url)
-
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("Only public HTTP/HTTPS destinations are permitted.")
-
-    host = parsed.hostname.lower().rstrip(".")
-
-    if host == "localhost" or host.endswith((".localhost", ".local")):
-        raise ValueError("Local hostnames are blocked.")
-
+def is_public_host(url):
+    """Block localhost, private IPs, and hostnames resolving to non-public IPs."""
     try:
-        addresses = [ipaddress.ip_address(host)]
-    except ValueError:
+        parsed = urlparse(url)
+        host = parsed.hostname
+
+        if not host:
+            return False
+
+        if host.lower() == "localhost" or host.lower().endswith(".localhost"):
+            return False
+
         try:
-            results = socket.getaddrinfo(
-                host,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
+            addresses = [ipaddress.ip_address(host)]
+        except ValueError:
+            answers = socket.getaddrinfo(
+                host, parsed.port or (443 if parsed.scheme == "https" else 80),
                 type=socket.SOCK_STREAM,
             )
-            addresses = list({
-                ipaddress.ip_address(item[4][0])
-                for item in results
-            })
-        except (socket.gaierror, ValueError, OSError):
-            raise ValueError(f"Could not resolve hostname: {host}")
+            addresses = [ipaddress.ip_address(item[4][0]) for item in answers]
 
-    if not addresses:
-        raise ValueError("No IP address found for hostname.")
+        return bool(addresses) and all(ip.is_global for ip in addresses)
 
-    for address in addresses:
-        if not address.is_global:
-            raise ValueError(f"Blocked a non-public network address: {host}")
+    except Exception:
+        return False
 
 
-def detect_cloudflare_block(title, body_text, current_url=""):
-    """
-    Identify common Cloudflare block/challenge indicators.
-    This detects a block; it does not bypass the challenge.
-    """
-    text = f"{title}\n{body_text}\n{current_url}".lower()
-
-    indicators = [
-        "sorry, you have been blocked",
-        "you are unable to access",
-        "attention required! | cloudflare",
-        "error 1010",
-        "error 1020",
-        "cf-error-details",
-        "cloudflare ray id",
-        "checking your browser before accessing",
-        "verify you are human",
-        "enable javascript and cookies to continue",
-    ]
-
-    return any(indicator in text for indicator in indicators)
-
-
-def ensure_browser_installed():
-    from playwright.sync_api import sync_playwright as playwright
-
-    with playwright() as p:
-        if os.path.exists(p.chromium.executable_path):
-            return
-
-    result = subprocess.run(
+@st.cache_resource
+def ensure_browser():
+    """Install Playwright Chromium on the Streamlit server if needed."""
+    subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+        timeout=240,
         capture_output=True,
         text=True,
-        timeout=240,
     )
-
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "Unknown error")[-2000:]
-        raise RuntimeError(
-            "Chromium installation failed. Check the deployment logs.\n" + details
-        )
+    return True
 
 
-def add_history(history, seen, url, source, details=""):
-    if not url or len(history) >= MAX_HISTORY:
-        return
-
-    try:
-        url = normalize_url(url)
-    except ValueError:
-        return
-
-    if url in seen:
-        return
-
-    seen.add(url)
-    history.append({
-        "Step": len(history) + 1,
-        "URL": url,
-        "Detected by": source,
-        "Details": details,
-    })
-
-
-def resolve_link(start_url, wait_seconds, scroll_count, timeout_seconds):
+def resolve_url(start_url, wait_seconds, scroll_passes):
     history = []
-    seen_urls = set()
-    candidates = {}
-    controls = []
-    warnings = []
-    blocked_requests = []
-    navigation_count = 0
+    responses = []
+    seen = set()
+    errors = []
+    candidate_links = []
+    candidate_controls = []
+    final_url = start_url
+    page_title = ""
+    page_text = ""
+    blocked = False
 
-    ensure_browser_installed()
+    def record(url, reason):
+        if url and url not in seen:
+            seen.add(url)
+            history.append({
+                "Step": len(history) + 1,
+                "URL": url,
+                "Observed by": reason,
+            })
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-
         context = browser.new_context(
-            accept_downloads=False,
             viewport={"width": 1365, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            locale="en-US",
+            accept_downloads=False,
         )
-
         page = context.new_page()
-        page.set_default_timeout(5000)
+        page.set_default_timeout(8000)
 
-        # Apply a basic public-address check to every requested URL.
-        def route_handler(route):
+        # Validate every requested URL, including redirects and subresources.
+        def guard_route(route):
             request_url = route.request.url
+            if urlparse(request_url).scheme not in ("http", "https"):
+                return route.abort()
 
-            # Ignore browser-internal requests.
-            if request_url.startswith(("data:", "blob:", "about:")):
-                route.continue_()
-                return
+            if not is_public_host(request_url):
+                return route.abort()
 
-            try:
-                check_public_url(request_url)
-                route.continue_()
-            except Exception as exc:
-                if len(blocked_requests) < 50:
-                    blocked_requests.append({
-                        "URL": request_url,
-                        "Reason": str(exc)[:300],
-                    })
-                route.abort("blockedbyclient")
+            return route.continue_()
 
-        page.route("**/*", route_handler)
+        page.route("**/*", guard_route)
 
         def on_navigation(frame):
-            nonlocal navigation_count
+            if frame == page.main_frame:
+                record(frame.url, "Main-frame navigation")
 
-            if frame != page.main_frame:
-                return
-
-            navigation_count += 1
-            add_history(
-                history,
-                seen_urls,
-                frame.url,
-                "Browser navigation",
-                "Main page URL changed",
-            )
-
-        page.on("framenavigated", on_navigation)
-
-        title = ""
-        body_text = ""
-        final_url = start_url
-
-        try:
-            check_public_url(start_url)
-            add_history(
-                history,
-                seen_urls,
-                start_url,
-                "Input",
-                "Original submitted URL",
-            )
-
+        def on_response(response):
             try:
-                page.goto(
-                    start_url,
-                    wait_until="domcontentloaded",
-                    timeout=timeout_seconds * 1000,
-                )
-            except PlaywrightTimeoutError:
-                warnings.append(
-                    "The initial page load timed out. The page may still have loaded partially."
-                )
-            except Exception as exc:
-                warnings.append(f"Navigation error: {str(exc)[:400]}")
-
-            # Observe JavaScript redirects and timer-based URL changes.
-            deadline = time.monotonic() + wait_seconds
-
-            while time.monotonic() < deadline:
-                if navigation_count >= MAX_NAVIGATIONS:
-                    warnings.append("Navigation limit reached.")
-                    break
-
-                add_history(
-                    history,
-                    seen_urls,
-                    page.url,
-                    "URL monitor",
-                    "Observed during waiting period",
-                )
-
-                try:
-                    page.wait_for_timeout(500)
-                except Exception:
-                    break
-
-            # Gradually scroll to reveal lazy-loaded links.
-            for _ in range(scroll_count):
-                try:
-                    page.evaluate(
-                        "() => window.scrollBy(0, Math.max(500, window.innerHeight * 0.8))"
-                    )
-                    page.wait_for_timeout(700)
-
-                    add_history(
-                        history,
-                        seen_urls,
-                        page.url,
-                        "Scroll monitor",
-                        "URL observed after scrolling",
-                    )
-                except Exception as exc:
-                    warnings.append(f"Scrolling stopped: {str(exc)[:200]}")
-                    break
-
-            final_url = page.url
-
-            try:
-                title = page.title()
+                if response.request.is_navigation_request():
+                    responses.append({
+                        "Status": response.status,
+                        "URL": response.url,
+                        "Redirected from": (
+                            response.request.redirected_from.url
+                            if response.request.redirected_from else ""
+                        ),
+                    })
             except Exception:
                 pass
 
-            try:
-                body_text = page.locator("body").inner_text(timeout=2000)[:6000]
-            except Exception:
-                body_text = ""
+        page.on("framenavigated", on_navigation)
+        page.on("response", on_response)
+        record(start_url, "Submitted URL")
 
-            # Detect common block pages before presenting links as useful results.
-            cloudflare_blocked = detect_cloudflare_block(
-                title,
-                body_text,
-                final_url,
+        try:
+            page.goto(
+                start_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
             )
+        except PlaywrightTimeoutError:
+            errors.append("Initial page load timed out; continuing inspection.")
+        except Exception as exc:
+            errors.append(f"Initial navigation: {str(exc)[:300]}")
 
-            if cloudflare_blocked:
-                warnings.append(
-                    "Cloudflare block or verification page detected. "
-                    "Open the URL in your regular browser and complete any "
-                    "legitimate verification manually. This app does not bypass "
-                    "Cloudflare protections."
-                )
+        deadline = time.monotonic() + wait_seconds
 
-            # Extract rendered links and common redirect hints.
+        # Observe JavaScript redirects, meta refreshes, and timer navigation.
+        # Scroll gradually to reveal lazy-loaded links.
+        for index in range(scroll_passes + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
             try:
-                extracted = page.evaluate(
-                    """() => {
-                        const results = [];
+                record(page.url, "URL monitor")
 
-                        const add = (url, text, type) => {
-                            if (url) {
-                                results.push({
-                                    url: String(url),
-                                    text: String(text || '').trim().slice(0, 250),
-                                    type
-                                });
-                            }
-                        };
+                if index < scroll_passes:
+                    page.evaluate(
+                        "() => window.scrollTo(0, document.body.scrollHeight)"
+                    )
 
-                        for (const a of document.querySelectorAll('a[href]')) {
-                            add(
-                                a.href,
-                                a.innerText || a.getAttribute('aria-label') || '',
-                                'Link'
-                            );
-                        }
+                pause = min(3, max(0.5, remaining))
+                page.wait_for_timeout(int(pause * 1000))
+                record(page.url, "After wait/scroll")
 
-                        for (const el of document.querySelectorAll(
-                            'button, input[type="button"], input[type="submit"], [role="button"]'
-                        )) {
-                            const text = (
-                                el.innerText ||
-                                el.value ||
-                                el.getAttribute('aria-label') ||
-                                ''
-                            ).trim();
-
-                            if (/continue|next|proceed|download|skip|unlock|go to link/i.test(text)) {
-                                results.push({
-                                    url: '',
-                                    text: text.slice(0, 250),
-                                    type: 'Possible control'
-                                });
-                            }
-                        }
-
-                        const refresh = document.querySelector(
-                            'meta[http-equiv="refresh" i]'
-                        );
-
-                        if (refresh) {
-                            const match = (refresh.content || '').match(
-                                /url\\s*=\\s*['"]?([^'"]+)/i
-                            );
-
-                            if (match) {
-                                add(match[1], 'Meta refresh', 'Meta refresh');
-                            }
-                        }
-
-                        const canonical = document.querySelector(
-                            'link[rel="canonical"]'
-                        );
-
-                        if (canonical) {
-                            add(canonical.href, 'Canonical URL', 'Canonical');
-                        }
-
-                        return results.slice(0, 500);
-                    }"""
-                )
             except Exception as exc:
-                extracted = []
-                warnings.append(f"Could not extract page links: {str(exc)[:250]}")
+                errors.append(f"Page monitoring: {str(exc)[:250]}")
+                break
 
-            for item in extracted:
-                kind = item.get("type", "Link")
-                text = item.get("text", "")
-                raw_url = item.get("url", "")
+        # Continue observing until the requested timer has elapsed.
+        while time.monotonic() < deadline:
+            try:
+                record(page.url, "Timer monitor")
+                page.wait_for_timeout(500)
+            except Exception as exc:
+                errors.append(f"Monitoring ended: {str(exc)[:250]}")
+                break
 
-                if kind == "Possible control":
-                    if text and text not in controls and len(controls) < 50:
-                        controls.append(text)
-                    continue
+        try:
+            final_url = page.url
+            page_title = page.title()
+            page_text = page.locator("body").inner_text(timeout=5000)[:12000]
 
-                try:
-                    candidate_url = normalize_url(raw_url)
-                    check_public_url(candidate_url)
-                except ValueError:
-                    continue
-
-                if candidate_url not in candidates and len(candidates) < MAX_LINKS:
-                    candidates[candidate_url] = {
-                        "URL": candidate_url,
-                        "Link text": text or "(no text)",
-                        "Type": kind,
-                    }
-
-            add_history(
-                history,
-                seen_urls,
-                final_url,
-                "Final observation",
-                "Last observed URL",
+            candidate_links = page.locator("a[href]").evaluate_all(
+                """els => els.slice(0, 500).map(a => ({
+                    text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
+                    url: a.href,
+                    visible: !!(a.offsetWidth || a.offsetHeight ||
+                                a.getClientRects().length)
+                }))"""
             )
 
-        finally:
-            context.close()
-            browser.close()
+            candidate_controls = page.locator(
+                "button, input[type=button], input[type=submit], [role=button]"
+            ).evaluate_all(
+                """els => els.slice(0, 150).map(e => ({
+                    text: (e.innerText || e.value ||
+                           e.getAttribute('aria-label') || '').trim()
+                })).filter(x => x.text &&
+                    /continue|next|proceed|download|skip|unlock|visit|go to link/i.test(x.text))"""
+            )
 
-    page_indicators = []
+            lower = (page_title + "\n" + page_text).lower()
+            blocked = any(term in lower for term in [
+                "sorry, you have been blocked",
+                "you are unable to access",
+                "attention required! | cloudflare",
+                "error 1020",
+                "cloudflare ray id",
+                "cf-error-details",
+            ])
 
-    if detect_cloudflare_block(title, body_text, final_url):
-        page_indicators.append("Cloudflare block or verification detected")
+            record(final_url, "Final URL")
 
-    lowered_text = body_text.lower()
+        except Exception as exc:
+            errors.append(f"Page inspection: {str(exc)[:250]}")
 
-    if "captcha" in lowered_text or "verify you are human" in lowered_text:
-        page_indicators.append("Possible CAPTCHA or human-verification step")
-
-    if "javascript is required" in lowered_text:
-        page_indicators.append("Page may require JavaScript")
-
-    if controls:
-        page_indicators.append("Possible Continue/Next controls detected")
-
-    if not candidates:
-        page_indicators.append("No candidate destination links extracted")
+        context.close()
+        browser.close()
 
     return {
-        "final_url": final_url,
-        "title": title,
         "history": history,
-        "links": list(candidates.values()),
-        "controls": controls,
-        "warnings": warnings,
-        "blocked_requests": blocked_requests,
-        "page_indicators": page_indicators,
-        "body_text": body_text,
+        "responses": responses,
+        "errors": errors,
+        "final_url": final_url,
+        "title": page_title,
+        "text": page_text,
+        "links": candidate_links,
+        "controls": candidate_controls,
+        "blocked": blocked,
     }
 
 
 with st.sidebar:
     st.header("Resolution settings")
+    wait_seconds = st.slider("Wait for page navigation (seconds)", 5, 30, 15)
+    scroll_passes = st.slider("Scroll passes", 0, 8, 3)
+    st.caption("The browser runs on the Streamlit server, not your phone.")
 
-    wait_seconds = st.slider(
-        "Wait for JavaScript / timers",
-        min_value=0,
-        max_value=30,
-        value=15,
-    )
-
-    scroll_count = st.slider(
-        "Scroll passes",
-        min_value=0,
-        max_value=8,
-        value=3,
-    )
-
-    timeout_seconds = st.slider(
-        "Page-load timeout (seconds)",
-        min_value=10,
-        max_value=60,
-        value=30,
-    )
-
-with st.form("resolver_form"):
-    submitted_url = st.text_input(
+with st.form("resolve_form"):
+    entered_url = st.text_input(
         "Short URL",
         placeholder="https://arolinks.com/flzphw",
     )
-    submitted = st.form_submit_button("Resolve link", type="primary")
+    submitted = st.form_submit_button("Resolve URL", type="primary")
 
 if submitted:
     try:
-        start_url = normalize_url(submitted_url)
+        start_url = normalize_url(entered_url)
 
-        with st.spinner("Opening link and observing navigation..."):
-            result = resolve_link(
-                start_url,
-                wait_seconds,
-                scroll_count,
-                timeout_seconds,
+        if not is_public_host(start_url):
+            st.error("This URL resolves to a non-public or inaccessible host.")
+            st.stop()
+
+        with st.spinner("Preparing the hosted browser..."):
+            ensure_browser()
+
+        with st.spinner(
+            "Following redirects and observing JavaScript navigation..."
+        ):
+            st.session_state["resolution"] = resolve_url(
+                start_url, wait_seconds, scroll_passes
             )
 
-        st.session_state["resolver_result"] = result
-
+    except subprocess.TimeoutExpired:
+        st.error("Chromium installation timed out. Check the app logs.")
     except Exception as exc:
-        st.error(f"Could not resolve URL: {exc}")
+        st.error(f"Resolution failed: {str(exc)[:500]}")
 
-result = st.session_state.get("resolver_result")
+result = st.session_state.get("resolution")
 
 if result:
     st.subheader("Resolution result")
 
-    st.write("**Page title:**", result["title"] or "(not available)")
+    if result["blocked"]:
+        st.warning(
+            "A Cloudflare/access block appears to be present. "
+            "This hosted server cannot guarantee access to the destination."
+        )
+
+    st.write("**Page title:**", result["title"] or "(unavailable)")
     st.write("**Last observed URL:**")
     st.code(result["final_url"], language=None)
 
     if result["final_url"]:
-        st.link_button("Open last observed page", result["final_url"])
+        st.link_button("Open last observed URL", result["final_url"])
 
-    for indicator in result["page_indicators"]:
-        if "Cloudflare" in indicator or "CAPTCHA" in indicator:
-            st.warning(indicator)
-        else:
-            st.info(indicator)
+    st.subheader("Navigation history")
+    st.dataframe(result["history"], use_container_width=True, hide_index=True)
 
+    st.subheader("HTTP navigation responses")
+    if result["responses"]:
+        st.dataframe(
+            result["responses"], use_container_width=True, hide_index=True
+        )
+    else:
+        st.info("No navigation responses were captured.")
+
+    st.subheader("Possible Continue / Next controls")
     if result["controls"]:
-        st.subheader("Possible manual steps")
-        st.write(
-            "These controls were identified by their visible text. "
-            "Review the page manually; this app does not click them."
-        )
-
-        for control in result["controls"]:
-            st.write(f"- {control}")
-
-    st.subheader("Intermediate URL history")
-
-    if result["history"]:
         st.dataframe(
-            result["history"],
-            use_container_width=True,
-            hide_index=True,
+            result["controls"], use_container_width=True, hide_index=True
+        )
+        st.caption(
+            "These are detected controls, not proof that clicking them is safe "
+            "or necessary. Review them manually."
         )
     else:
-        st.info("No navigation history was captured.")
+        st.write("No likely controls detected.")
 
-    st.subheader("Possible destination links")
-
+    st.subheader("Extracted links")
     if result["links"]:
-        st.dataframe(
-            result["links"],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(result["links"], use_container_width=True, hide_index=True)
     else:
-        st.info("No candidate links were extracted.")
+        st.write("No links extracted.")
 
-    if result["warnings"]:
-        with st.expander("Warnings and navigation errors"):
-            for warning in result["warnings"]:
-                st.write(f"- {warning}")
+    with st.expander("Page text"):
+        st.text(result["text"] or "(No page text available)")
 
-    if result["blocked_requests"]:
-        with st.expander("Blocked network requests"):
-            st.dataframe(
-                result["blocked_requests"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with st.expander("Page text preview"):
-        st.text(result["body_text"] or "(No page text available)")
+    with st.expander("Errors"):
+        for error in result["errors"]:
+            st.write(f"- {error}")
