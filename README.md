@@ -1,27 +1,73 @@
-# Telegram Shortlink Resolver — Streamlit deploy package
 
-A Streamlit starter app for short links commonly shared in Telegram download channels.
+# Smart Shortlink Resolver
 
-## Included
-- HTTP redirect resolution (validates every redirect destination)
-- Extracts likely links from common HTML patterns, meta refresh, redirect query parameters, and simple JavaScript location assignments
-- Candidate links displayed with open buttons
-- Blocks private/local/reserved IP addresses as a basic SSRF mitigation
-- Request timeouts and HTML size cap
+A Streamlit application that helps inspect short links and multi-step redirect pages.
 
-## Deploy free on Streamlit Community Cloud
-1. Download and extract this ZIP.
-2. Create a GitHub repository (for example `telegram-shortlink-resolver`) and upload `streamlit_app.py`, `requirements.txt`, and `README.md` to the repository root.
-3. Sign in at https://share.streamlit.io/ with GitHub.
-4. Choose **Create app**, select your repository and branch, set the main file path to `streamlit_app.py`, then click **Deploy**.
-5. Streamlit will provide a public `*.streamlit.app` URL.
+## Features
 
-Official docs: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy
+- Follows normal HTTP and HTTPS redirects.
+- Observes JavaScript-driven navigation and URL changes.
+- Waits for configurable periods to allow automatic timers to finish.
+- Scrolls pages to reveal lazy-loaded content.
+- Records intermediate URLs observed during navigation.
+- Extracts candidate destination links from the rendered page.
+- Detects likely Continue, Next, Download, and similar controls.
+- Displays warnings for possible CAPTCHA or human-verification steps.
+- Includes basic checks intended to block local and private network destinations.
+
+## Files
+
+- `streamlit_app.py` — application.
+- `requirements.txt` — Python dependencies.
+- `packages.txt` — Linux libraries for Chromium on Streamlit Cloud.
+
+## Run locally
+
+Use Python 3.10 or later.
+
+Create a virtual environment:
+
+```bash
+python -m venv .venv
+```
+
+Activate it on Windows:
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+Start the application:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Open the local URL displayed in your terminal.
+
+## Deploy to Streamlit Community Cloud
+
+1. Upload these files to the root of your GitHub repository.
+2. Open https://share.streamlit.io/
+3. Create a new app and select your repository.
+4. Set the branch to `main`.
+5. Set the main file path to `streamlit_app.py`.
+6. Deploy the app.
+
+The application attempts to install Chromium when it starts. Browser installation may take time, and some hosting environments may need additional system libraries.
 
 ## Important limitations
-This is a generic resolver, not a universal bypass. GPLinks, AroLinks, Linkvertise, LootLabs, Work.ink and other services may change their markup or require JavaScript, timers, CAPTCHA, login, cookies, or server-side token generation. Site-specific support must be tested and maintained; no support is claimed just because a service appears in the app's list.
 
-Do not use this app to evade access controls or complete prohibited ad/click fraud. Review destination domains before opening links.
-
-## Public hosting warning
-Any public URL-fetching service can be abused. The app validates host IPs and each redirect, but production-grade deployment should add outbound network egress restrictions and stronger DNS-rebinding defenses. Do not process confidential URLs on a public instance.
+- The resolver observes automatic navigation; it does not automatically click through ad-gated Continue buttons.
+- It does not solve CAPTCHAs or bypass authentication, paywalls, or other access controls.
+- Some websites require cookies, user interaction, or browser features that a headless browser cannot reproduce.
+- A discovered link is a candidate destination, not a guarantee that it is the final download.
+- Public hosting can expose the app to abuse. The included network checks are basic safeguards, not a complete production-grade SSRF defense. Do not expose this app as a trusted public service without additional network isolation, request limits, and security review.
+- Websites may block automated browsers, change their layouts, or use techniques that prevent reliable resolution.
